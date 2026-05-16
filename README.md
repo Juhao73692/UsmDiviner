@@ -60,7 +60,7 @@ python UsmDiviner.py input.usm --mux-mkv --ffmpeg "D:/tools/ffmpeg/bin/ffmpeg.ex
 | `-o, --output` | 输出目录，默认为 `output` |
 | `--no-parallel` | 关闭多进程 |
 | `--report` | 为每个 USM 生成 `report.json` |
-| `--fast` | 仅使用前 100 MB 视频数据恢复密钥 |
+| `--fast` | 仅使用前 50 MB 视频数据恢复密钥 |
 | `--key KEY` | 手动指定 16 位十六进制 USM 密钥 |
 | `--extract-only` | 不解密视频和音频流，仅原样提取 |
 | `--vgmstream PATH` | 手动指定 vgmstream-cli 路径 |

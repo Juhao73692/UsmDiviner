@@ -7,7 +7,13 @@ from collections import defaultdict
 from pathlib import Path
 
 from .audio import decide_audio_for_channel
-from .constants import AUDIO_PROBE_BYTES_PER_CHANNEL, FAST_CRACK_VIDEO_BYTES, SIG_SFA, SIG_SFV
+from .constants import (
+    AUDIO_PROBE_BYTES_PER_CHANNEL,
+    BIGRAM_BEAM,
+    FAST_CRACK_VIDEO_BYTES,
+    SIG_SFA,
+    SIG_SFV,
+)
 from .crack import crack_keys_from_usm
 from .exceptions import ExternalToolError, KeyCrackError
 from .formats import classify_audio, detect_video_stream
@@ -167,6 +173,7 @@ def _crack_key(usm_path: Path, fast: bool) -> tuple[bytes, bytes, dict]:
     key1, key2, crack_stats = crack_keys_from_usm(
         usm_path,
         max_video_bytes=FAST_CRACK_VIDEO_BYTES if fast else None,
+        beam_size=BIGRAM_BEAM,
     )
     if key1 is None or key2 is None:
         raise KeyCrackError(crack_stats)

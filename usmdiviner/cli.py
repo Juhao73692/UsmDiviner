@@ -28,7 +28,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="use only the first 100 MB of encrypted video data for key recovery",
+        help="use only the first 50 MB of encrypted video data for key recovery",
     )
     parser.add_argument(
         "--key",
