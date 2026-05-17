@@ -8,7 +8,11 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from .constants import (
-    BIGRAM_BEAM,
+    SOLVER_BEAM,
+    SOLVER_L1_BEAM,
+    BIGRAM_ADAPT_MIN_HITS,
+    BIGRAM_LOW_CONF_FF_WEIGHT,
+    BIGRAM_LOW_CONF_ZERO_WEIGHT,
     BIGRAM_RATIO_MAX,
     BIGRAM_RATIO_MIN,
     BIGRAM_WEIGHT_TOTAL,
@@ -26,20 +30,22 @@ BigramWeights = tuple[int, int]
 def crack_keys_from_usm(
     usm_path: str | Path,
     max_video_bytes: int | None = None,
-    beam_size: int = BIGRAM_BEAM,
+    beam_size: int = SOLVER_BEAM,
+    l1_beam_size: int = SOLVER_L1_BEAM,
 ) -> tuple[bytes | None, bytes | None, dict]:
     path = Path(usm_path)
     if path.stat().st_size == 0:
         raise UsmFormatError("empty USM file")
 
     with path.open("rb") as fp, mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as data:
-        return _crack_from_buffer(data, max_video_bytes, beam_size)
+        return _crack_from_buffer(data, max_video_bytes, beam_size, l1_beam_size)
 
 
 def _crack_from_buffer(
     data,
     max_video_bytes: int | None,
     beam_size: int,
+    l1_beam_size: int,
 ) -> tuple[bytes | None, bytes | None, dict]:
     offset = 0
     data_len = len(data)
@@ -125,12 +131,14 @@ def _crack_from_buffer(
             "odd_bigram_ff": odd_bigram_ff,
             "odd_bigram_ratio": odd_ratio,
             "beam_size": beam_size,
+            "l1_beam_size": l1_beam_size,
         }
 
     best_score, best_vm1 = _solve_vm1_bigram(
         unigram,
         bigram,
         beam_size,
+        l1_beam_size,
         bigram_weights,
     )
 
@@ -148,6 +156,7 @@ def _crack_from_buffer(
             "odd_bigram_ff": odd_bigram_ff,
             "odd_bigram_ratio": odd_ratio,
             "beam_size": beam_size,
+            "l1_beam_size": l1_beam_size,
         }
 
     key1 = bytes([
@@ -177,6 +186,7 @@ def _crack_from_buffer(
         "odd_bigram_ff": odd_bigram_ff,
         "odd_bigram_ratio": odd_ratio,
         "beam_size": beam_size,
+        "l1_beam_size": l1_beam_size,
     }
 
 
@@ -231,6 +241,11 @@ def _estimate_bigram_weights(
     odd_zero: int,
     odd_ff: int,
 ) -> tuple[int, int, float | None]:
+    total_hits = odd_zero + odd_ff
+    if total_hits < BIGRAM_ADAPT_MIN_HITS:
+        raw_ratio = (odd_zero / odd_ff) if odd_ff else BIGRAM_RATIO_MAX
+        return BIGRAM_LOW_CONF_ZERO_WEIGHT, BIGRAM_LOW_CONF_FF_WEIGHT, raw_ratio
+
     raw_ratio = (odd_zero / odd_ff) if odd_ff else BIGRAM_RATIO_MAX
     adjusted_ratio = max(BIGRAM_RATIO_MIN, min(BIGRAM_RATIO_MAX, raw_ratio))
     zero_weight = round(BIGRAM_WEIGHT_TOTAL * adjusted_ratio / (1.0 + adjusted_ratio))
@@ -242,11 +257,13 @@ def _solve_vm1_bigram(
     unigram: ScoreMatrix,
     bigram: ScoreMatrix,
     beam_size: int,
+    l1_beam_size: int,
     bigram_weights: BigramWeights,
 ) -> tuple[int, list[int] | None]:
     beam = max(1, beam_size)
+    l1_beam = max(1, l1_beam_size)
 
-    level1 = _top(_iter_level1(unigram, bigram, bigram_weights), beam)
+    level1 = _top(_iter_level1(unigram, bigram, bigram_weights), l1_beam)
     level2 = _extend_level0(level1, unigram, bigram, beam, bigram_weights)
     level3 = _extend_level3(level2, unigram, bigram, beam, bigram_weights)
     level4 = _extend_level4(level3, unigram, bigram, beam, bigram_weights)
