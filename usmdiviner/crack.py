@@ -9,7 +9,9 @@ from pathlib import Path
 
 from .constants import (
     BIGRAM_BEAM,
-    BIGRAM_WEIGHT,
+    BIGRAM_RATIO_MAX,
+    BIGRAM_RATIO_MIN,
+    BIGRAM_WEIGHT_TOTAL,
     SIG_SFV,
     VIDEO_CRACK_START,
     VIDEO_MASK_START,
@@ -18,6 +20,7 @@ from .exceptions import UsmFormatError
 
 ScoreMatrix = list[array]
 Candidate = tuple[int, list[int]]
+BigramWeights = tuple[int, int]
 
 
 def crack_keys_from_usm(
@@ -45,6 +48,8 @@ def _crack_from_buffer(
     chunks_seen = 0
     video_crack_bytes_used = 0
     sample_rows = 0
+    odd_bigram_zero = 0
+    odd_bigram_ff = 0
     crack_limited = max_video_bytes is not None
 
     while offset + 32 <= data_len:
@@ -82,17 +87,28 @@ def _crack_from_buffer(
                 if encrypted_size >= 32:
                     video_blocks_found += 1
                     video_crack_bytes_used += encrypted_size
-                    sample_rows += _accumulate_score_matrices(
+                    rows, odd_zero, odd_ff = _accumulate_score_matrices(
                         data,
                         encrypted_start,
                         encrypted_size,
                         unigram,
                         bigram,
                     )
+                    sample_rows += rows
+                    odd_bigram_zero += odd_zero
+                    odd_bigram_ff += odd_ff
                     if max_video_bytes is not None and video_crack_bytes_used >= max_video_bytes:
                         break
 
         offset = next_offset
+
+    bigram_zero_weight, bigram_ff_weight, odd_ratio = (
+        _estimate_bigram_weights(
+            odd_bigram_zero,
+            odd_bigram_ff,
+        )
+    )
+    bigram_weights = (bigram_zero_weight, bigram_ff_weight)
 
     if video_blocks_found == 0 or sample_rows == 0:
         return None, None, {
@@ -103,11 +119,20 @@ def _crack_from_buffer(
             "fast_enabled": crack_limited,
             "video_crack_bytes_limit": max_video_bytes,
             "video_crack_bytes_used": video_crack_bytes_used,
-            "bigram_weight": BIGRAM_WEIGHT,
+            "bigram_zero_weight": bigram_zero_weight,
+            "bigram_ff_weight": bigram_ff_weight,
+            "odd_bigram_zero": odd_bigram_zero,
+            "odd_bigram_ff": odd_bigram_ff,
+            "odd_bigram_ratio": odd_ratio,
             "beam_size": beam_size,
         }
 
-    best_score, best_vm1 = _solve_vm1_bigram(unigram, bigram, beam_size)
+    best_score, best_vm1 = _solve_vm1_bigram(
+        unigram,
+        bigram,
+        beam_size,
+        bigram_weights,
+    )
 
     if best_vm1 is None:
         return None, None, {
@@ -117,7 +142,11 @@ def _crack_from_buffer(
             "fast_enabled": crack_limited,
             "video_crack_bytes_limit": max_video_bytes,
             "video_crack_bytes_used": video_crack_bytes_used,
-            "bigram_weight": BIGRAM_WEIGHT,
+            "bigram_zero_weight": bigram_zero_weight,
+            "bigram_ff_weight": bigram_ff_weight,
+            "odd_bigram_zero": odd_bigram_zero,
+            "odd_bigram_ff": odd_bigram_ff,
+            "odd_bigram_ratio": odd_ratio,
             "beam_size": beam_size,
         }
 
@@ -142,7 +171,11 @@ def _crack_from_buffer(
         "fast_enabled": crack_limited,
         "video_crack_bytes_limit": max_video_bytes,
         "video_crack_bytes_used": video_crack_bytes_used,
-        "bigram_weight": BIGRAM_WEIGHT,
+        "bigram_zero_weight": bigram_zero_weight,
+        "bigram_ff_weight": bigram_ff_weight,
+        "odd_bigram_zero": odd_bigram_zero,
+        "odd_bigram_ff": odd_bigram_ff,
+        "odd_bigram_ratio": odd_ratio,
         "beam_size": beam_size,
     }
 
@@ -159,10 +192,12 @@ def _accumulate_score_matrices(
     size: int,
     unigram: ScoreMatrix,
     bigram: ScoreMatrix,
-) -> int:
+) -> tuple[int, int, int]:
     num_blocks = size // 32
     current_s = bytearray(32)
     rows = 0
+    odd_bigram_zero = 0
+    odd_bigram_ff = 0
 
     for i in range(num_blocks):
         block_start = start + i * 32
@@ -180,24 +215,43 @@ def _accumulate_score_matrices(
                 left = current_s[j]
                 right = current_s[j + 1]
                 bigram[j][(left << 8) | right] += 1
-                bigram[j][((left ^ 0xFF) << 8) | (right ^ 0xFF)] += 1
+        else:
+            for j in range(31):
+                left = current_s[j]
+                right = current_s[j + 1]
+                if left == 0x00 and right == 0x00:
+                    odd_bigram_zero += 1
+                elif left == 0xFF and right == 0xFF:
+                    odd_bigram_ff += 1
 
-    return rows
+    return rows, odd_bigram_zero, odd_bigram_ff
+
+
+def _estimate_bigram_weights(
+    odd_zero: int,
+    odd_ff: int,
+) -> tuple[int, int, float | None]:
+    raw_ratio = (odd_zero / odd_ff) if odd_ff else BIGRAM_RATIO_MAX
+    adjusted_ratio = max(BIGRAM_RATIO_MIN, min(BIGRAM_RATIO_MAX, raw_ratio))
+    zero_weight = round(BIGRAM_WEIGHT_TOTAL * adjusted_ratio / (1.0 + adjusted_ratio))
+    ff_weight = BIGRAM_WEIGHT_TOTAL - zero_weight
+    return zero_weight, ff_weight, raw_ratio
 
 
 def _solve_vm1_bigram(
     unigram: ScoreMatrix,
     bigram: ScoreMatrix,
     beam_size: int,
+    bigram_weights: BigramWeights,
 ) -> tuple[int, list[int] | None]:
     beam = max(1, beam_size)
 
-    level1 = _top(_iter_level1(unigram, bigram), beam)
-    level2 = _extend_level0(level1, unigram, bigram, beam)
-    level3 = _extend_level3(level2, unigram, bigram, beam)
-    level4 = _extend_level4(level3, unigram, bigram, beam)
-    level5 = _extend_level6(level4, unigram, bigram, beam)
-    level6 = _extend_level5(level5, unigram, bigram, beam)
+    level1 = _top(_iter_level1(unigram, bigram, bigram_weights), beam)
+    level2 = _extend_level0(level1, unigram, bigram, beam, bigram_weights)
+    level3 = _extend_level3(level2, unigram, bigram, beam, bigram_weights)
+    level4 = _extend_level4(level3, unigram, bigram, beam, bigram_weights)
+    level5 = _extend_level6(level4, unigram, bigram, beam, bigram_weights)
+    level6 = _extend_level5(level5, unigram, bigram, beam, bigram_weights)
 
     if not level6:
         return -1, None
@@ -205,7 +259,11 @@ def _solve_vm1_bigram(
     return best_score, best_vm1
 
 
-def _iter_level1(unigram: ScoreMatrix, bigram: ScoreMatrix) -> Iterable[Candidate]:
+def _iter_level1(
+    unigram: ScoreMatrix,
+    bigram: ScoreMatrix,
+    bigram_weights: BigramWeights,
+) -> Iterable[Candidate]:
     for v1 in range(256):
         for v2 in range(256):
             v = [0] * 32
@@ -226,10 +284,10 @@ def _iter_level1(unigram: ScoreMatrix, bigram: ScoreMatrix) -> Iterable[Candidat
                 + unigram[15][v[15]]
                 + unigram[16][v[16]]
                 + unigram[18][v[18]]
-                + BIGRAM_WEIGHT * (
-                    _bg(bigram, 1, v[1], v[2])
-                    + _bg(bigram, 10, v[10], v[11])
-                    + _bg(bigram, 15, v[15], v[16])
+                + (
+                    _bg(bigram, 1, v[1], v[2], bigram_weights)
+                    + _bg(bigram, 10, v[10], v[11], bigram_weights)
+                    + _bg(bigram, 15, v[15], v[16], bigram_weights)
                 )
             )
             yield score, v
@@ -240,6 +298,7 @@ def _extend_level0(
     unigram: ScoreMatrix,
     bigram: ScoreMatrix,
     beam: int,
+    bigram_weights: BigramWeights,
 ) -> list[Candidate]:
     out: list[Candidate] = []
     for prev_score, prev_v in candidates:
@@ -256,14 +315,14 @@ def _extend_level0(
                 + unigram[9][v[9]]
                 + unigram[12][v[12]]
                 + unigram[17][v[17]]
-                + BIGRAM_WEIGHT * (
-                    _bg(bigram, 0, v[0], v[1])
-                    + _bg(bigram, 7, v[7], v[8])
-                    + _bg(bigram, 8, v[8], v[9])
-                    + _bg(bigram, 9, v[9], v[10])
-                    + _bg(bigram, 11, v[11], v[12])
-                    + _bg(bigram, 16, v[16], v[17])
-                    + _bg(bigram, 17, v[17], v[18])
+                + (
+                    _bg(bigram, 0, v[0], v[1], bigram_weights)
+                    + _bg(bigram, 7, v[7], v[8], bigram_weights)
+                    + _bg(bigram, 8, v[8], v[9], bigram_weights)
+                    + _bg(bigram, 9, v[9], v[10], bigram_weights)
+                    + _bg(bigram, 11, v[11], v[12], bigram_weights)
+                    + _bg(bigram, 16, v[16], v[17], bigram_weights)
+                    + _bg(bigram, 17, v[17], v[18], bigram_weights)
                 )
             )
             out.append((score, v))
@@ -275,6 +334,7 @@ def _extend_level3(
     unigram: ScoreMatrix,
     bigram: ScoreMatrix,
     beam: int,
+    bigram_weights: BigramWeights,
 ) -> list[Candidate]:
     out: list[Candidate] = []
     for prev_score, prev_v in candidates:
@@ -295,12 +355,12 @@ def _extend_level3(
                 + unigram[23][v[23]]
                 + unigram[25][v[25]]
                 + unigram[28][v[28]]
-                + BIGRAM_WEIGHT * (
-                    _bg(bigram, 2, v[2], v[3])
-                    + _bg(bigram, 12, v[12], v[13])
-                    + _bg(bigram, 13, v[13], v[14])
-                    + _bg(bigram, 14, v[14], v[15])
-                    + _bg(bigram, 18, v[18], v[19])
+                + (
+                    _bg(bigram, 2, v[2], v[3], bigram_weights)
+                    + _bg(bigram, 12, v[12], v[13], bigram_weights)
+                    + _bg(bigram, 13, v[13], v[14], bigram_weights)
+                    + _bg(bigram, 14, v[14], v[15], bigram_weights)
+                    + _bg(bigram, 18, v[18], v[19], bigram_weights)
                 )
             )
             out.append((score, v))
@@ -312,6 +372,7 @@ def _extend_level4(
     unigram: ScoreMatrix,
     bigram: ScoreMatrix,
     beam: int,
+    bigram_weights: BigramWeights,
 ) -> list[Candidate]:
     out: list[Candidate] = []
     for prev_score, prev_v in candidates:
@@ -328,11 +389,11 @@ def _extend_level4(
                 + unigram[26][v[26]]
                 + unigram[29][v[29]]
                 + unigram[31][v[31]]
-                + BIGRAM_WEIGHT * (
-                    _bg(bigram, 3, v[3], v[4])
-                    + _bg(bigram, 19, v[19], v[20])
-                    + _bg(bigram, 25, v[25], v[26])
-                    + _bg(bigram, 28, v[28], v[29])
+                + (
+                    _bg(bigram, 3, v[3], v[4], bigram_weights)
+                    + _bg(bigram, 19, v[19], v[20], bigram_weights)
+                    + _bg(bigram, 25, v[25], v[26], bigram_weights)
+                    + _bg(bigram, 28, v[28], v[29], bigram_weights)
                 )
             )
             out.append((score, v))
@@ -344,6 +405,7 @@ def _extend_level6(
     unigram: ScoreMatrix,
     bigram: ScoreMatrix,
     beam: int,
+    bigram_weights: BigramWeights,
 ) -> list[Candidate]:
     out: list[Candidate] = []
     for prev_score, prev_v in candidates:
@@ -356,10 +418,10 @@ def _extend_level6(
                 unigram[6][v[6]]
                 + unigram[22][v[22]]
                 + unigram[27][v[27]]
-                + BIGRAM_WEIGHT * (
-                    _bg(bigram, 6, v[6], v[7])
-                    + _bg(bigram, 26, v[26], v[27])
-                    + _bg(bigram, 27, v[27], v[28])
+                + (
+                    _bg(bigram, 6, v[6], v[7], bigram_weights)
+                    + _bg(bigram, 26, v[26], v[27], bigram_weights)
+                    + _bg(bigram, 27, v[27], v[28], bigram_weights)
                 )
             )
             out.append((score, v))
@@ -371,6 +433,7 @@ def _extend_level5(
     unigram: ScoreMatrix,
     bigram: ScoreMatrix,
     beam: int,
+    bigram_weights: BigramWeights,
 ) -> list[Candidate]:
     out: list[Candidate] = []
     for prev_score, prev_v in candidates:
@@ -385,24 +448,36 @@ def _extend_level5(
                 + unigram[21][v[21]]
                 + unigram[24][v[24]]
                 + unigram[30][v[30]]
-                + BIGRAM_WEIGHT * (
-                    _bg(bigram, 4, v[4], v[5])
-                    + _bg(bigram, 5, v[5], v[6])
-                    + _bg(bigram, 20, v[20], v[21])
-                    + _bg(bigram, 21, v[21], v[22])
-                    + _bg(bigram, 22, v[22], v[23])
-                    + _bg(bigram, 23, v[23], v[24])
-                    + _bg(bigram, 24, v[24], v[25])
-                    + _bg(bigram, 29, v[29], v[30])
-                    + _bg(bigram, 30, v[30], v[31])
+                + (
+                    _bg(bigram, 4, v[4], v[5], bigram_weights)
+                    + _bg(bigram, 5, v[5], v[6], bigram_weights)
+                    + _bg(bigram, 20, v[20], v[21], bigram_weights)
+                    + _bg(bigram, 21, v[21], v[22], bigram_weights)
+                    + _bg(bigram, 22, v[22], v[23], bigram_weights)
+                    + _bg(bigram, 23, v[23], v[24], bigram_weights)
+                    + _bg(bigram, 24, v[24], v[25], bigram_weights)
+                    + _bg(bigram, 29, v[29], v[30], bigram_weights)
+                    + _bg(bigram, 30, v[30], v[31], bigram_weights)
                 )
             )
             out.append((score, v))
     return _top(out, beam)
 
 
-def _bg(bigram: ScoreMatrix, index: int, left: int, right: int) -> int:
-    return bigram[index][(left << 8) | right]
+def _bg(
+    bigram: ScoreMatrix,
+    index: int,
+    left: int,
+    right: int,
+    bigram_weights: BigramWeights,
+) -> int:
+    bigram_zero_weight, bigram_ff_weight = bigram_weights
+    pair_ff = (left << 8) | right
+    pair_zero = ((left ^ 0xFF) << 8) | (right ^ 0xFF)
+    return (
+        bigram_ff_weight * bigram[index][pair_ff]
+        + bigram_zero_weight * bigram[index][pair_zero]
+    )
 
 
 def _top(candidates: Iterable[Candidate], beam: int) -> list[Candidate]:
