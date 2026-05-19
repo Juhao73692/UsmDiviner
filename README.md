@@ -66,7 +66,7 @@ python UsmDiviner.py input.usm --mux-mkv --ffmpeg "D:/tools/ffmpeg/bin/ffmpeg.ex
 | `--vgmstream PATH` | 手动指定 vgmstream-cli 路径 |
 | `--keep-intermediate-audio` | 音频解码成功后保留 `.hca/.adx` 和 `.hcakey` 文件 |
 | `--no-adx-audiomask` | 不对 ADX 应用 AudioMask，默认结果为杂音时可尝试使用 |
-| `--mux-mkv` | 使用 ffmpeg 封装为 MKV，仅当 USM 中包含音频流时生效 |
+| `--mux-mkv` | 使用 ffmpeg 封装为 MKV |
 | `--ffmpeg PATH` | 手动指定 ffmpeg 路径 |
 
 ## 输出

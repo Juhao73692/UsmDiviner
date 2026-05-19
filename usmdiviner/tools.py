@@ -110,8 +110,6 @@ def mux_to_mkv(
         return False, "video stream does not exist"
 
     existing_audio = [p for p in audio_inputs if p.exists() and p.stat().st_size > 0]
-    if not existing_audio:
-        return False, "no usable audio stream"
 
     output_mkv.parent.mkdir(parents=True, exist_ok=True)
     _safe_unlink(output_mkv)
@@ -122,7 +120,10 @@ def mux_to_mkv(
     cmd.extend(["-map", "0:v:0"])
     for i in range(len(existing_audio)):
         cmd.extend(["-map", f"{i + 1}:a:0"])
-    cmd.extend(["-c:v", "copy", "-c:a", "flac", str(output_mkv)])
+    cmd.extend(["-c:v", "copy"])
+    if existing_audio:
+        cmd.extend(["-c:a", "flac"])
+    cmd.append(str(output_mkv))
 
     try:
         proc = subprocess.run(

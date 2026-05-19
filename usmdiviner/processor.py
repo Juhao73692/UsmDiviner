@@ -376,13 +376,6 @@ def _maybe_mux(
         elif audio_decisions[ch].format == "adx":
             mux_audio_inputs.append(audio_path)
 
-    if not mux_audio_inputs:
-        return {
-            "ok": False,
-            "mkv": None,
-            "log_tail": "no decoded/usable audio stream; MKV not created",
-        }, False
-
     ffmpeg = find_ffmpeg(opt.ffmpeg)
     if not ffmpeg:
         return {"ok": False, "mkv": None, "log_tail": "ffmpeg not found"}, False

@@ -58,7 +58,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--mux-mkv",
         action="store_true",
-        help="mux decrypted video and audio into MKV when audio is available",
+        help="mux decrypted video and usable audio into MKV",
     )
     parser.add_argument(
         "--ffmpeg",

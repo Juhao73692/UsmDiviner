@@ -21,6 +21,15 @@ from .constants import (
     VIDEO_MASK_START,
 )
 from .exceptions import UsmFormatError
+from .vp9_superframe_constraints import (
+    Vm1Constraints,
+    Vp9ConstraintStats,
+    extract_vp9_superframe_constraints,
+    format_vm1_constraints,
+    build_vm1_constraints,
+    payload_starts_vp9_stream,
+    plain_vm1_constraints,
+)
 
 ScoreMatrix = list[array]
 Candidate = tuple[int, list[int]]
@@ -56,7 +65,11 @@ def _crack_from_buffer(
     sample_rows = 0
     odd_bigram_zero = 0
     odd_bigram_ff = 0
+    vp9_constraints: Vm1Constraints = {}
+    vp9_constraint_stats = Vp9ConstraintStats()
+    vp9_stream_detected = False
     crack_limited = max_video_bytes is not None
+    enable_c9_template = data_len < 2_000_000
 
     while offset + 32 <= data_len:
         header = data[offset:offset + 32]
@@ -80,17 +93,38 @@ def _crack_from_buffer(
 
         chunks_seen += 1
         if signature == SIG_SFV and data_type == 0:
+            if not vp9_stream_detected:
+                header_probe_size = min(payload_size, 44)
+                header_probe = data[payload_start:payload_start + header_probe_size]
+                if payload_starts_vp9_stream(header_probe):
+                    vp9_stream_detected = True
+
             if payload_size - VIDEO_MASK_START >= 0x200:
                 encrypted_start = payload_start + VIDEO_CRACK_START
                 encrypted_size = payload_size - VIDEO_CRACK_START
+                constraint_encrypted_size = encrypted_size
                 if max_video_bytes is not None:
                     remaining = max_video_bytes - video_crack_bytes_used
                     if remaining < 32:
                         break
-                    encrypted_size = min(encrypted_size, remaining)
+                    constraint_encrypted_size = min(encrypted_size, remaining)
+                    encrypted_size = constraint_encrypted_size
 
                 encrypted_size -= encrypted_size % 32
                 if encrypted_size >= 32:
+                    constraint_payload_size = min(
+                        payload_size,
+                        VIDEO_CRACK_START + constraint_encrypted_size,
+                    )
+                    payload = data[payload_start:payload_start + constraint_payload_size]
+                    if vp9_stream_detected:
+                        new_stats = extract_vp9_superframe_constraints(
+                            payload,
+                            enable_c9_template=enable_c9_template,
+                        )
+                        vp9_constraint_stats.merge(new_stats)
+                        vp9_constraints = build_vm1_constraints(vp9_constraint_stats)
+
                     video_blocks_found += 1
                     video_crack_bytes_used += encrypted_size
                     rows, odd_zero, odd_ff = _accumulate_score_matrices(
@@ -132,6 +166,7 @@ def _crack_from_buffer(
             "odd_bigram_ratio": odd_ratio,
             "beam_size": beam_size,
             "l1_beam_size": l1_beam_size,
+            **_vp9_report(vp9_stream_detected, vp9_constraints, vp9_constraint_stats),
         }
 
     best_score, best_vm1 = _solve_vm1_bigram(
@@ -140,6 +175,7 @@ def _crack_from_buffer(
         beam_size,
         l1_beam_size,
         bigram_weights,
+        plain_vm1_constraints(vp9_constraints),
     )
 
     if best_vm1 is None:
@@ -157,6 +193,7 @@ def _crack_from_buffer(
             "odd_bigram_ratio": odd_ratio,
             "beam_size": beam_size,
             "l1_beam_size": l1_beam_size,
+            **_vp9_report(vp9_stream_detected, vp9_constraints, vp9_constraint_stats),
         }
 
     key1 = bytes([
@@ -187,6 +224,24 @@ def _crack_from_buffer(
         "odd_bigram_ratio": odd_ratio,
         "beam_size": beam_size,
         "l1_beam_size": l1_beam_size,
+        **_vp9_report(vp9_stream_detected, vp9_constraints, vp9_constraint_stats),
+    }
+
+
+def _vp9_report(
+    vp9_stream_detected: bool,
+    constraints: Vm1Constraints,
+    stats: Vp9ConstraintStats,
+) -> dict:
+    if not vp9_stream_detected:
+        return {}
+
+    return {
+        "vp9": {
+            "constraints": format_vm1_constraints(constraints),
+            "constraint_conflicts": stats.conflict_total,
+            "constraint_stats": stats.as_report(),
+        }
     }
 
 
@@ -259,19 +314,22 @@ def _solve_vm1_bigram(
     beam_size: int,
     l1_beam_size: int,
     bigram_weights: BigramWeights,
+    known_vm1: Vm1Constraints | None = None,
 ) -> tuple[int, list[int] | None]:
     beam = max(1, beam_size)
     l1_beam = max(1, l1_beam_size)
+    known = known_vm1 or {}
 
-    level1 = _top(_iter_level1(unigram, bigram, bigram_weights), l1_beam)
-    level2 = _extend_level0(level1, unigram, bigram, beam, bigram_weights)
-    level3 = _extend_level3(level2, unigram, bigram, beam, bigram_weights)
-    level4 = _extend_level4(level3, unigram, bigram, beam, bigram_weights)
-    level5 = _extend_level6(level4, unigram, bigram, beam, bigram_weights)
-    level6 = _extend_level5(level5, unigram, bigram, beam, bigram_weights)
+    level1 = _top(_iter_level1(unigram, bigram, bigram_weights, known), l1_beam)
+    level2 = _extend_level0(level1, unigram, bigram, beam, bigram_weights, known)
+    level3 = _extend_level3(level2, unigram, bigram, beam, bigram_weights, known)
+    level4 = _extend_level4(level3, unigram, bigram, beam, bigram_weights, known)
+    level5 = _extend_level6(level4, unigram, bigram, beam, bigram_weights, known)
+    level6 = _extend_level5(level5, unigram, bigram, beam, bigram_weights, known)
 
     if not level6:
         return -1, None
+
     best_score, best_vm1 = level6[0]
     return best_score, best_vm1
 
@@ -280,6 +338,7 @@ def _iter_level1(
     unigram: ScoreMatrix,
     bigram: ScoreMatrix,
     bigram_weights: BigramWeights,
+    known_vm1: Vm1Constraints,
 ) -> Iterable[Candidate]:
     for v1 in range(256):
         for v2 in range(256):
@@ -292,6 +351,8 @@ def _iter_level1(
             v[15] = (v[10] - v[11]) & 0xFF
             v[16] = (v[8] - v[15]) & 0xFF
             v[18] = v[15] ^ 0xFF
+            if not _matches_known(v, known_vm1, (1, 2, 8, 10, 11, 15, 16, 18)):
+                continue
             score = (
                 unigram[1][v[1]]
                 + unigram[2][v[2]]
@@ -316,6 +377,7 @@ def _extend_level0(
     bigram: ScoreMatrix,
     beam: int,
     bigram_weights: BigramWeights,
+    known_vm1: Vm1Constraints,
 ) -> list[Candidate]:
     out: list[Candidate] = []
     for prev_score, prev_v in candidates:
@@ -326,6 +388,8 @@ def _extend_level0(
             v[9] = (v[1] - v[7]) & 0xFF
             v[12] = (v[11] + v[9]) & 0xFF
             v[17] = v[16] ^ v[7]
+            if not _matches_known(v, known_vm1, (0, 7, 9, 12, 17)):
+                continue
             score = prev_score + (
                 unigram[0][v[0]]
                 + unigram[7][v[7]]
@@ -352,6 +416,7 @@ def _extend_level3(
     bigram: ScoreMatrix,
     beam: int,
     bigram_weights: BigramWeights,
+    known_vm1: Vm1Constraints,
 ) -> list[Candidate]:
     out: list[Candidate] = []
     for prev_score, prev_v in candidates:
@@ -364,6 +429,8 @@ def _extend_level3(
             v[23] = (v[19] - v[15]) & 0xFF
             v[25] = (0x21 - v[19]) & 0xFF
             v[28] = (v[23] + 0x44) & 0xFF
+            if not _matches_known(v, known_vm1, (3, 13, 14, 19, 23, 25, 28)):
+                continue
             score = prev_score + (
                 unigram[3][v[3]]
                 + unigram[13][v[13]]
@@ -390,6 +457,7 @@ def _extend_level4(
     bigram: ScoreMatrix,
     beam: int,
     bigram_weights: BigramWeights,
+    known_vm1: Vm1Constraints,
 ) -> list[Candidate]:
     out: list[Candidate] = []
     for prev_score, prev_v in candidates:
@@ -400,6 +468,8 @@ def _extend_level4(
             v[26] = v[20] ^ v[23]
             v[29] = (v[3] + v[4]) & 0xFF
             v[31] = v[29] ^ v[19]
+            if not _matches_known(v, known_vm1, (4, 20, 26, 29, 31)):
+                continue
             score = prev_score + (
                 unigram[4][v[4]]
                 + unigram[20][v[20]]
@@ -423,6 +493,7 @@ def _extend_level6(
     bigram: ScoreMatrix,
     beam: int,
     bigram_weights: BigramWeights,
+    known_vm1: Vm1Constraints,
 ) -> list[Candidate]:
     out: list[Candidate] = []
     for prev_score, prev_v in candidates:
@@ -431,6 +502,8 @@ def _extend_level6(
             v[6] = v6
             v[22] = v[6] ^ 0xF3
             v[27] = (v[22] + v[22]) & 0xFF
+            if not _matches_known(v, known_vm1, (6, 22, 27)):
+                continue
             score = prev_score + (
                 unigram[6][v[6]]
                 + unigram[22][v[22]]
@@ -451,6 +524,7 @@ def _extend_level5(
     bigram: ScoreMatrix,
     beam: int,
     bigram_weights: BigramWeights,
+    known_vm1: Vm1Constraints,
 ) -> list[Candidate]:
     out: list[Candidate] = []
     for prev_score, prev_v in candidates:
@@ -460,6 +534,8 @@ def _extend_level5(
             v[21] = (v[5] + 0xED) & 0xFF
             v[24] = (v[21] + v[7]) & 0xFF
             v[30] = (v[5] - v[22]) & 0xFF
+            if not _matches_known(v, known_vm1, (5, 21, 24, 30)):
+                continue
             score = prev_score + (
                 unigram[5][v[5]]
                 + unigram[21][v[21]]
@@ -479,6 +555,18 @@ def _extend_level5(
             )
             out.append((score, v))
     return _top(out, beam)
+
+
+def _matches_known(
+    vm1: list[int],
+    known_vm1: Vm1Constraints,
+    indices: tuple[int, ...],
+) -> bool:
+    for index in indices:
+        allowed = known_vm1.get(index)
+        if allowed is not None and vm1[index] not in allowed:
+            return False
+    return True
 
 
 def _bg(
